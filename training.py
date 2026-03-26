@@ -40,8 +40,6 @@ DATASET_SOURCES = [
     "artillerywu/DeepResearch-9K",
     "tandevllc/offsec_redteam_codes",
     "TeichAI/Claude-Opus-Dataclaw-Unredacted",
-    "nvidia/OpenMathReasoning",
-    "nvidia/Nemotron-Post-Training-Dataset-v1",
     "nvidia/OpenCodeReasoning-2",
     "nvidia/Nemotron-SFT-Competitive-Programming-v2",
     "nvidia/Nemotron-Terminal-Synthetic-Tasks",
