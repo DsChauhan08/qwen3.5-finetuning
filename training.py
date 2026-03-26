@@ -32,7 +32,6 @@ DATASET_SOURCES = [
     "Crownelius/Gemini-3-Pro-Opus-4.5-Kimi-K2.5-13000x-formatted",
     "Crownelius/GLM-5.0-8000x-formatted-fixed",
     "Crownelius/Agentic-SFT-1000x",
-    "pranavupadhyaya52/AM-DeepSeek-R1-Distilled-1.4M-cleaned",
     "Roman1111111/gpt-5.4-step-by-step-reasoning",
     "Roman1111111/claude-opus-4.6-10000x",
     "Roman1111111/gemini-3.1-pro-hard-high-reasoning",
