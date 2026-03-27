@@ -1,540 +1,796 @@
-import os, gc, json, queue, random, shutil, threading, time
+
+import gc
+import json
+import random
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import Optional
 
-os.environ["TOKENIZERS_PARALLELISM"]    = "false"
-os.environ["WANDB_DISABLED"]            = "true"
-os.environ["ARROW_DEFAULT_MEMORY_POOL"] = "system"
-
-import torch
 import numpy as np
-import datasets
-
-datasets.config.IN_MEMORY_MAX_SIZE = 80 * 1024 * 1024  
+import torch
+from datasets import concatenate_datasets, load_dataset
+from huggingface_hub import HfApi, login, snapshot_download
+from transformers import AutoTokenizer
 
 random.seed(SEED)
 np.random.seed(SEED)
 torch.manual_seed(SEED)
-if torch.cuda.is_available():
-    torch.cuda.manual_seed_all(SEED)
 
-from unsloth import FastModel                         
-from peft import PeftModel
-from datasets import load_dataset
-from huggingface_hub import HfApi, login, snapshot_download
-from transformers import AutoTokenizer, get_cosine_schedule_with_warmup
+print(f"\nPyTorch : {torch.__version__}  |  CUDA : {torch.version.cuda}")
+print(f"GPUs    : {torch.cuda.device_count()}")
+for i in range(torch.cuda.device_count()):
+    p = torch.cuda.get_device_properties(i)
+    print(f"  [{i}] {p.name}  {p.total_memory / 1e9:.1f} GB")
 
-# ── Added New Datasets Here ─────────────────────────────────────────
-DATASET_SOURCES = [
-    "nohurry/Opus-4.6-Reasoning-3000x-filtered",
-    "Crownelius/Opus-4.5-3000x-formatted",
-    "Crownelius/Opus-4.6-Reasoning-2100x-formatted",
-    "Crownelius/Gemini-3-Pro-Opus-4.5-Kimi-K2.5-13000x-formatted",
-    "Crownelius/GLM-5.0-8000x-formatted-fixed",
-    "Crownelius/Agentic-SFT-1000x",
-    "Roman1111111/gpt-5.4-step-by-step-reasoning",
-    "Roman1111111/claude-opus-4.6-10000x",
-    "Roman1111111/gemini-3.1-pro-hard-high-reasoning",
-    "dalisoft/claude-opus-4.6-high-reasoning-700x",
-    "artillerywu/DeepResearch-9K",
-    "tandevllc/offsec_redteam_codes",
-    "TeichAI/Claude-Opus-Dataclaw-Unredacted",
-    "nvidia/OpenCodeReasoning-2",
-    "nvidia/Nemotron-SFT-Competitive-Programming-v2",
-    "nvidia/Nemotron-Terminal-Synthetic-Tasks",
-    "nvidia/Nemotron-RL-ReasoningGym-v1",
-]
-
+# ── HF auth ───────────────────────────────────────────────────────────────
 login(token=HF_TOKEN)
 api = HfApi(token=HF_TOKEN)
 try:
     api.create_repo(HUB_REPO, private=True, exist_ok=True)
-    print(f"HF repo ready: {HUB_REPO}")
+    print(f"\n✅  HF repo: https://huggingface.co/{HUB_REPO}")
 except Exception as e:
-    print(f"Repo creation note: {e}")
+    print(f"ℹ️   Repo note: {e}")
 
-OUTPUT_DIR = Path("./qwen_train_out")
-OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+Path(OUTPUT_DIR).mkdir(parents=True, exist_ok=True)
 
-def _snap_step(name: str) -> int:
+
+# ─────────────────────────────────────────────────────────────────────────
+#  RESUME: download the latest checkpoint from HF Hub
+#
+#  hub_strategy="checkpoint" (set in Cell 4's SFTConfig) pushes two things
+#  after every SAVE_EVERY_STEPS steps:
+#    1. checkpoint-{step}/   (individual numbered folder — like every_save)
+#    2. last-checkpoint/     (always the most recent, for easy resuming)
+#
+#  We try last-checkpoint/ first (guaranteed to be the newest) and fall
+#  back to scanning for checkpoint-N/ patterns (safety net).
+# ─────────────────────────────────────────────────────────────────────────
+
+def hub_resume() -> bool:
+    """
+    Finds and downloads the latest training checkpoint from HF Hub.
+    Returns True if a usable checkpoint was downloaded.
+
+    Strategy:
+      1. Try last-checkpoint/  (maintained by hub_strategy="checkpoint")
+      2. Fall back to highest-numbered checkpoint-N/
+    """
+    print("\n🔍  Checking HF Hub for latest checkpoint…")
     try:
-        return int(name.rsplit("_", 1)[-1])
-    except Exception:
-        return -1
-
-def _find_latest_snap_name(repo_id: str) -> Optional[str]:
-    try:
-        files = list(api.list_repo_files(repo_id))
-        names = sorted(
-            {p.split("/")[1] for p in files
-             if p.startswith("snapshots/")
-             and len(p.split("/")) > 1
-             and p.split("/")[1].startswith("snap_")},
-            key=_snap_step,
-        )
-        return names[-1] if names else None
-    except Exception:
-        return None
-
-def _download_snapshot(repo_id: str) -> Optional[Path]:
-    name = _find_latest_snap_name(repo_id)
-    if not name:
-        return None
-    root = OUTPUT_DIR / "resume"
-    root.mkdir(parents=True, exist_ok=True)
-    try:
-        snapshot_download(
-            repo_id=repo_id,
-            allow_patterns=f"snapshots/{name}/*",
-            local_dir=str(root),
-            token=HF_TOKEN,
-        )
-        p = root / "snapshots" / name
-        return p if p.exists() else None
+        all_files = list(api.list_repo_files(HUB_REPO))
     except Exception as e:
-        print(f"Resume download failed: {e}")
-        return None
+        print(f"    Hub unreachable ({e}) — starting fresh")
+        return False
 
-print("\n🔍  Looking for existing checkpoint on HF Hub…")
-resume_dir = _download_snapshot(HUB_REPO)
-if resume_dir:
-    print(f"✅  Checkpoint found: {resume_dir.name}")
-else:
-    print("ℹ️   No checkpoint — starting fresh.")
+    if not all_files:
+        print("    Repo is empty — starting fresh")
+        return False
 
-_state: dict = {
-    "global_step":    0,
-    "micro_step":     0,
-    "source_offsets": [0] * len(DATASET_SOURCES),
-}
+    def _download(folder_pattern: str, display_name: str) -> bool:
+        """Download a specific folder from the hub into OUTPUT_DIR."""
+        matching = [f for f in all_files if f.startswith(f"{folder_pattern}/")]
+        if not matching:
+            return False
+        print(f"    Downloading {display_name}…")
+        try:
+            snapshot_download(
+                repo_id        = HUB_REPO,
+                allow_patterns = [f"{folder_pattern}/*"],
+                local_dir      = OUTPUT_DIR,
+                token          = HF_TOKEN,
+            )
+            state_path = Path(OUTPUT_DIR) / folder_pattern / "trainer_state.json"
+            if not state_path.exists():
+                print(f"    ⚠️  trainer_state.json not found in {folder_pattern} — corrupt?")
+                return False
+            step = json.loads(state_path.read_text()).get("global_step", "?")
+            print(f"    ✅  Checkpoint ready at optimiser step {step}")
+            return True
+        except Exception as e:
+            print(f"    Download failed: {e}")
+            return False
 
-if resume_dir and (resume_dir / "state.json").exists():
-    try:
-        _state.update(json.loads((resume_dir / "state.json").read_text()))
-    except Exception as e:
-        print(f"⚠️   state.json load failed: {e}")
+    # ── Option 1: last-checkpoint/ (hub_strategy="checkpoint" always keeps this) ──
+    if _download("last-checkpoint", "last-checkpoint/"):
+        # Trainer.train(resume_from_checkpoint=True) looks for the
+        # LATEST local checkpoint-N/ folder. We need to rename
+        # last-checkpoint/ to a checkpoint-N/ name so Trainer finds it.
+        state_path = Path(OUTPUT_DIR) / "last-checkpoint" / "trainer_state.json"
+        try:
+            step       = json.loads(state_path.read_text()).get("global_step", 0)
+            target_dir = Path(OUTPUT_DIR) / f"checkpoint-{step}"
+            src_dir    = Path(OUTPUT_DIR) / "last-checkpoint"
+            if not target_dir.exists():
+                src_dir.rename(target_dir)
+                print(f"    Renamed last-checkpoint/ → checkpoint-{step}/")
+            else:
+                print(f"    checkpoint-{step}/ already exists locally — using it")
+        except Exception as e:
+            print(f"    Rename failed ({e}) — Trainer will still try to find it")
+        return True
 
-global_step    = int(_state["global_step"])
-micro_step     = int(_state["micro_step"])
-source_offsets = list(_state.get("source_offsets", [0] * len(DATASET_SOURCES)))
-if len(source_offsets) != len(DATASET_SOURCES):
-    source_offsets = [0] * len(DATASET_SOURCES)
+    # ── Option 2: scan for checkpoint-N/ (fallback) ──────────────────────
+    ckpt_names: set[str] = set()
+    for f in all_files:
+        part = f.split("/")[0]
+        if part.startswith("checkpoint-"):
+            try:
+                int(part.split("-", 1)[1])
+                ckpt_names.add(part)
+            except ValueError:
+                pass
 
-print("\n🚀  Loading model…")
+    if not ckpt_names:
+        print("    No checkpoints found — starting fresh")
+        return False
 
-base_model, tokenizer = FastModel.from_pretrained(
-    model_name    = MODEL_NAME,
-    max_seq_length= SEQ_LEN,
-    load_in_4bit  = False,        
-    load_in_16bit = True,         
-    dtype         = torch.bfloat16,  
-    full_finetuning = False,
-)
+    latest = max(ckpt_names, key=lambda x: int(x.split("-", 1)[1]))
+    return _download(latest, latest)
 
-if resume_dir and (resume_dir / "tokenizer").exists():
-    try:
-        tokenizer = AutoTokenizer.from_pretrained(
-            str(resume_dir / "tokenizer"), use_fast=True)
-    except Exception as e:
-        print(f"Tokenizer checkpoint load failed: {e}")
 
+HAS_CHECKPOINT = hub_resume()
+DATASET_PATH   = "./processed_train"   # Shared between Cell 3 and Cell 4's train()
+
+
+# ─────────────────────────────────────────────────────────────────────────
+#  TOKENIZER  (loaded here for dataset formatting; re-created inside DDP)
+# ─────────────────────────────────────────────────────────────────────────
+
+print("\n📦  Loading tokenizer…")
+tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, trust_remote_code=True)
 if tokenizer.pad_token is None:
     tokenizer.pad_token    = tokenizer.eos_token
     tokenizer.pad_token_id = tokenizer.eos_token_id
 
-if resume_dir and (resume_dir / "adapter").exists():
-    model = PeftModel.from_pretrained(
-        base_model,
-        str(resume_dir / "adapter"),
-        is_trainable=True,
-    )
-else:
-    model = FastModel.get_peft_model(
-        base_model,
-        r            = LORA_R,
-        lora_alpha   = LORA_ALPHA,   
-        lora_dropout = LORA_DROPOUT, 
-        target_modules = [
-            "q_proj", "k_proj", "v_proj", "o_proj",
-            "gate_proj", "up_proj", "down_proj",
-        ],
-        use_gradient_checkpointing = "unsloth",  
-        random_state = SEED,
-        bias = "none",
-    )
+IM_END_STR = "<|im_end|>"
+IM_END_ID  = tokenizer.convert_tokens_to_ids(IM_END_STR)
+assert IM_END_ID != tokenizer.unk_token_id, \
+    "FATAL: <|im_end|> resolved to UNK — wrong tokenizer or model name!"
+print(f"    <|im_end|> token ID : {IM_END_ID}  ✅")
 
-try:
-    model.config.use_cache = False
-except Exception:
-    pass
-
-trainable = [p for p in model.parameters() if p.requires_grad]
-
-device = torch.device("cuda:0")
-autocast_ctx = torch.autocast(device_type="cuda", dtype=torch.bfloat16)
-
-optimizer = torch.optim.AdamW(
-    trainable,
-    lr           = LR,
-    weight_decay = 0.01,
-    betas        = (0.9, 0.95),
-    eps          = 1e-8,
+DEFAULT_SYSTEM = (
+    "You are Qwen, created by Alibaba Cloud. "
+    "You are a helpful and honest assistant."
 )
 
-scheduler = get_cosine_schedule_with_warmup(
-    optimizer,
-    num_warmup_steps  = WARMUP_STEPS,
-    num_training_steps= TRAIN_STEPS,
-)
+_ROLE = {
+    "human": "user", "user": "user",
+    "gpt": "assistant", "assistant": "assistant",
+    "bot": "assistant", "model": "assistant",
+    "chatgpt": "assistant", "claude": "assistant",
+    "system": "system", "sys": "system",
+}
 
-if resume_dir and (resume_dir / "optimizer.pt").exists():
-    try:
-        ckpt = torch.load(resume_dir / "optimizer.pt", map_location="cpu")
-        optimizer.load_state_dict(ckpt["optimizer"])
-        scheduler.load_state_dict(ckpt["scheduler"])
-    except Exception as e:
-        print(f"⚠️  Optimiser load failed: {e}")
 
-_RESP_HEADER     = "<|im_start|>assistant\n"
-_RESP_HEADER_IDS = tokenizer.encode(_RESP_HEADER, add_special_tokens=False)
-_IM_END_ID       = tokenizer.convert_tokens_to_ids("<|im_end|>")
-
-def _get_labels(input_ids: list) -> list:
-    labels = [-100] * len(input_ids)
-    n = len(input_ids)
-    k = len(_RESP_HEADER_IDS)
-    i = 0
-    while i <= n - k:
-        if input_ids[i : i + k] == _RESP_HEADER_IDS:
-            j = i + k
-            while j < n:
-                labels[j] = input_ids[j]
-                if input_ids[j] == _IM_END_ID:
-                    j += 1   
-                    break
-                j += 1
-            i = j   
-        else:
-            i += 1
-    return labels
+# ─────────────────────────────────────────────────────────────────────────
+#  FORMAT PIPELINE
+#  Every example → [{role, content}, …] → apply_chat_template → text string
+#
+#  Qwen3.5-4B chat format (what apply_chat_template produces):
+#
+#    <|im_start|>system
+#    You are Qwen...<|im_end|>
+#    <|im_start|>user
+#    [question]<|im_end|>
+#    <|im_start|>assistant
+#    <think>
+#    [reasoning chain — this is the most important part to preserve]
+#    </think>
+#    [final answer]<|im_end|>
+# ─────────────────────────────────────────────────────────────────────────
 
 def _to_messages(ex: dict) -> Optional[list]:
-    msgs_raw = ex.get("messages")
-    if isinstance(msgs_raw, list) and msgs_raw:
-        msgs = [{"role": str(m.get("role", "")),
-                 "content": str(m.get("content") or m.get("text") or "")}
-                for m in msgs_raw if isinstance(m, dict)]
-        if (all(m["role"] in ("system", "user", "assistant") for m in msgs)
-                and any(m["role"] == "assistant" for m in msgs)
-                and all(m["content"] for m in msgs)):
+    """
+    Converts any dataset row format to [{role, content}] for apply_chat_template.
+    Tries 6 formats in priority order. Returns None for unusable rows.
+    """
+
+    # 1. OpenAI messages format
+    raw = ex.get("messages")
+    if isinstance(raw, list) and raw:
+        msgs = [
+            {"role": _ROLE.get(str(m.get("role", "")).lower().strip(), ""),
+             "content": str(m.get("content") or m.get("text") or "").strip()}
+            for m in raw if isinstance(m, dict)
+        ]
+        msgs = [m for m in msgs if m["role"] and m["content"]]
+        if msgs and any(m["role"] == "assistant" for m in msgs):
             return msgs
 
+    # 2. ShareGPT conversations format  (human/gpt role names)
     convs = ex.get("conversations")
     if isinstance(convs, list) and convs:
-        _role = {"human": "user", "gpt": "assistant", "system": "system",
-                 "user":  "user", "assistant": "assistant", "bot": "assistant"}
         msgs = []
         for t in convs:
-            if not isinstance(t, dict): continue
-            role    = _role.get(str(t.get("from") or t.get("role") or ""), "")
+            if not isinstance(t, dict):
+                continue
+            role    = _ROLE.get(str(t.get("from") or t.get("role") or "").lower().strip(), "")
             content = str(t.get("value") or t.get("content") or "").strip()
             if role and content:
                 msgs.append({"role": role, "content": content})
         if msgs and any(m["role"] == "assistant" for m in msgs):
             return msgs
 
-    question = str(
-        ex.get("instruction") or ex.get("prompt") or
-        ex.get("question")    or ex.get("input")   or ""
-    ).strip()
-    answer = str(
-        ex.get("output")   or ex.get("response") or
-        ex.get("completion") or ex.get("answer") or ""
-    ).strip()
-    if question and answer:
-        msgs = []
-        sys_text = str(ex.get("system") or "").strip()
-        if sys_text: msgs.append({"role": "system", "content": sys_text})
-        msgs.append({"role": "user",      "content": question})
-        msgs.append({"role": "assistant", "content": answer})
-        return msgs
+    # 3. Prompt / response pairs
+    q = str(ex.get("instruction") or ex.get("prompt") or
+            ex.get("question")    or ex.get("input")   or "").strip()
+    a = str(ex.get("output")   or ex.get("response") or
+            ex.get("completion") or ex.get("answer")   or "").strip()
+    if q and a:
+        sys_ = str(ex.get("system") or "").strip()
+        return [
+            {"role": "system",    "content": sys_ or DEFAULT_SYSTEM},
+            {"role": "user",      "content": q},
+            {"role": "assistant", "content": a},
+        ]
 
+    # 4. Raw text with a <think>…</think> block  (reasoning traces)
     text = str(ex.get("text") or ex.get("content") or "").strip()
     if text and "<think>" in text and "</think>" in text:
         ctx = str(ex.get("context") or ex.get("query") or "").strip()
-        user_msg = ctx if ctx else "Solve the following problem step by step."
         return [
-            {"role": "user",      "content": user_msg},
+            {"role": "system",    "content": DEFAULT_SYSTEM},
+            {"role": "user",      "content": ctx or "Solve the following step by step."},
             {"role": "assistant", "content": text},
         ]
 
-    code = str(ex.get("code") or ex.get("func_code_string") or ex.get("whole_func_string") or "").strip()
-    lang = str(ex.get("language") or ex.get("programming_language") or "code").strip().lower()
-    if code and len(code) > 20:
+    # 5. Code files  (GitHub, security datasets)
+    code = str(ex.get("code") or ex.get("func_code_string") or
+               ex.get("whole_func_string") or "").strip()
+    lang = str(ex.get("language") or ex.get("programming_language") or "code").lower()
+    if code and len(code) > 40:
         return [
-            {"role": "user",      "content": f"Write a {lang} program."},
+            {"role": "system",    "content": DEFAULT_SYSTEM},
+            {"role": "user",      "content": f"Write a complete {lang} program."},
             {"role": "assistant", "content": f"```{lang}\n{code}\n```"},
         ]
 
-    if text and len(text) > 80:
+    # 6. Plain text fallback  (only substantial text)
+    if text and len(text) > 200:
         return [
-            {"role": "user",      "content": "Continue:"},
+            {"role": "system",    "content": DEFAULT_SYSTEM},
+            {"role": "user",      "content": "Continue the following text:"},
             {"role": "assistant", "content": text},
         ]
-    return None  
 
-def _format_one(ex: dict) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
+    return None   # Unusable example
+
+
+def _format_and_validate(ex: dict) -> dict:
+    """
+    Full per-example pipeline:
+      dict → messages → apply_chat_template → enforce <|im_end|> → {"text": ...}
+
+    Guarantees:
+      • Text uses official Qwen3.5 tokens (<|im_start|>, <|im_end|>, <think>)
+      • Text ends with <|im_end|>  (the stop signal — critical for preventing loops)
+      • Text tokenises to ≥ 20 tokens  (rejects trivial formatting artifacts)
+
+    Returns {"text": ""} for unusable rows; these are filtered out downstream.
+    """
     msgs = _to_messages(ex)
-    if msgs is None: return None
+    if msgs is None:
+        return {"text": ""}
+
     try:
         text = tokenizer.apply_chat_template(
-            msgs, tokenize=False, add_generation_prompt=False,
+            msgs,
+            tokenize              = False,
+            add_generation_prompt = False,
+            # enable_thinking defaults to True for Qwen3.5 —
+            # this preserves the <think>…</think> structure
         )
     except Exception:
-        return None
+        return {"text": ""}
 
-    max_chars = SEQ_LEN * 10
-    if len(text) > max_chars: text = text[:max_chars]
+    # Enforce <|im_end|> termination
+    text = text.rstrip()
+    if not text.endswith(IM_END_STR):
+        text = text + IM_END_STR
 
-    ids = tokenizer(
-        text, max_length=SEQ_LEN, truncation=True, padding=False,
-        add_special_tokens=False, return_tensors=None,
-    )["input_ids"]
+    # Reject trivially short examples
+    if len(tokenizer(text, add_special_tokens=False)["input_ids"]) < 20:
+        return {"text": ""}
 
-    if len(ids) < 8: return None  
+    return {"text": text}
 
-    labels = _get_labels(ids)
-    if all(lbl == -100 for lbl in labels): return None
 
-    return (torch.tensor(ids, dtype=torch.long), torch.tensor(labels, dtype=torch.long))
-
-def _load_stream(spec, skip: int = 0):
+def _load_source(source, max_rows: int) -> Optional[object]:
+    """Load, cap, format, and filter one dataset source."""
+    spec_str = str(source)
     try:
-        if isinstance(spec, tuple):
-            ds = load_dataset(spec[0], spec[1], split="train", streaming=True, trust_remote_code=True)
-        else:
-            ds = load_dataset(spec, split="train", streaming=True, trust_remote_code=True)
-
-        _KEEP = {
-            "text", "content", "prompt", "response", "completion", "messages", "conversations", "system", "instruction",
-            "output", "input", "question", "answer", "code", "func_code_string", "whole_func_string", "language",
-            "programming_language", "context", "query",
-        }
-        try:
-            cols = ds.column_names
-            if isinstance(cols, list):
-                drop = [c for c in cols if c.lower() not in _KEEP]
-                if drop: ds = ds.remove_columns(drop)
-        except Exception: pass
-
-        it = iter(ds)
-        for _ in range(skip): next(it, None)
-        return it
-    except Exception as e:
-        return None
-
-class SequenceBatcher:
-    def __init__(self, tokenizer, batch_size: int, source_offsets: List[int]):
-        self.tokenizer      = tokenizer
-        self.batch_size     = batch_size
-        self.source_offsets = list(source_offsets)
-        self._buf: List[Tuple[torch.Tensor, torch.Tensor]] = []
-        self._rr_ptr        = 0   
-        self._active: List[list] = []
-        for idx, spec in enumerate(DATASET_SOURCES):
-            it = _load_stream(spec, skip=self.source_offsets[idx])
-            if it is not None: self._active.append([idx, spec, it])
-
-    def _next_valid(self) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
-        if not self._active: return None
-        max_attempts = len(self._active) * 6
-        for _ in range(max_attempts):
-            if not self._active: return None
-            idx_in_list = self._rr_ptr % len(self._active)
-            src_idx, spec, it = self._active[idx_in_list]
-            self._rr_ptr += 1  
-            try:
-                ex = next(it)
-                self.source_offsets[src_idx] += 1
-                result = _format_one(ex)
-                del ex
-                if result is not None: return result
-            except StopIteration:
-                self._active.pop(idx_in_list)
-                if self._active: self._rr_ptr = self._rr_ptr % len(self._active)
-                else: return None
-            except Exception: pass
-        return None  
-
-    def next_batch(self) -> Optional[dict]:
-        while len(self._buf) < self.batch_size:
-            item = self._next_valid()
-            if item is None: break
-            self._buf.append(item)
-
-        if not self._buf: return None
-        items = self._buf[: self.batch_size]
-        self._buf = self._buf[self.batch_size :]
-
-        if len(items) == 1:
-            ids, lbls = items[0]
-            return {
-                "input_ids":      ids.unsqueeze(0).to(device),
-                "attention_mask": torch.ones_like(ids).unsqueeze(0).to(device),
-                "labels":         lbls.unsqueeze(0).to(device),
-            }
-
-        max_len = max(x[0].size(0) for x in items)
-        pad_id  = self.tokenizer.pad_token_id or 0
-        all_ids, all_mask, all_lbls = [], [], []
-        for ids, lbls in items:
-            pad = max_len - ids.size(0)
-            all_ids.append(torch.cat([ids,  ids.new_full((pad,), pad_id)]))
-            all_mask.append(torch.cat([torch.ones_like(ids), ids.new_zeros(pad)]))
-            all_lbls.append(torch.cat([lbls, lbls.new_full((pad,), -100)]))
-
-        return {
-            "input_ids":      torch.stack(all_ids).to(device),
-            "attention_mask": torch.stack(all_mask).to(device),
-            "labels":         torch.stack(all_lbls).to(device),
-        }
-
-    def state_dict(self) -> dict:
-        return {"source_offsets": self.source_offsets}
-
-batcher = SequenceBatcher(tokenizer=tokenizer, batch_size=BATCH, source_offsets=source_offsets)
-
-_upload_q:   "queue.Queue[Path]" = queue.Queue(maxsize=2)
-_stop_event  = threading.Event()
-_state_lock  = threading.Lock()
-_last_upload_ts = time.time()
-
-def _prune_hf_snapshots(keep: int = KEEP_SNAPSHOTS) -> None:
-    try:
-        files = list(api.list_repo_files(HUB_REPO))
-        names = sorted(
-            {p.split("/")[1] for p in files if p.startswith("snapshots/") and p.split("/")[1].startswith("snap_")},
-            key=_snap_step,
+        ds = (
+            load_dataset(source[0], source[1], split="train", trust_remote_code=True)
+            if isinstance(source, tuple)
+            else load_dataset(source, split="train", trust_remote_code=True)
         )
-        to_delete = names[:-keep] if len(names) > keep else []
-        for old_name in to_delete:
-            for f in files:
-                if f.startswith(f"snapshots/{old_name}/"):
-                    try: api.delete_file(path_in_repo=f, repo_id=HUB_REPO, token=HF_TOKEN)
-                    except Exception: pass
-    except Exception as e: pass
 
-def _save_snapshot(reason: str) -> None:
-    snap_name = f"snap_{global_step}"
-    snap_dir  = OUTPUT_DIR / "snapshots" / snap_name
-    snap_dir.mkdir(parents=True, exist_ok=True)
+        n  = min(max_rows, len(ds))
+        ds = ds.select(range(n))
 
-    with _state_lock:
-        snap_state = {
-            "reason":      reason,
-            "global_step": global_step,
-            "micro_step":  micro_step,
-            "timestamp":   int(time.time()),
-            **batcher.state_dict(),
-        }
+        # batched=True + num_proc=2 → ~40× faster than per-row processing
+        def _batch_format(batch: dict) -> dict:
+            keys = list(batch.keys())
+            n_   = len(batch[keys[0]])
+            return {"text": [
+                _format_and_validate({k: batch[k][i] for k in keys})["text"]
+                for i in range(n_)
+            ]}
 
-    try: model.save_pretrained(str(snap_dir / "adapter"))
-    except Exception as e: pass
-    try: tokenizer.save_pretrained(str(snap_dir / "tokenizer"))
-    except Exception: pass
-    try:
-        torch.save({"optimizer": optimizer.state_dict(), "scheduler": scheduler.state_dict()}, snap_dir / "optimizer.pt")
-    except Exception as e: pass
+        ds = ds.map(
+            _batch_format,
+            batched        = True,
+            batch_size     = 128,
+            num_proc       = 2,
+            remove_columns = ds.column_names,
+            desc           = f"  {spec_str[:42]}",
+        )
 
-    (snap_dir / "state.json").write_text(json.dumps(snap_state, indent=2))
+        before = len(ds)
+        ds     = ds.filter(lambda x: len(x["text"]) > 0, num_proc=2)
+        after  = len(ds)
+
+        print(f"  ✅  {spec_str[:60]:<60}  {after:>6,}  ({before-after} skipped)")
+        return ds if after > 0 else None
+
+    except Exception as e:
+        print(f"  ⚠️  {spec_str[:60]:<60}  FAILED — {e}")
+        return None
+
+
+print("\n📊  Loading & formatting datasets…")
+all_ds = []
+for src in DATASET_SOURCES:
+    cap = STYLE_CAPS.get(src if isinstance(src, str) else src[0], MAX_ROWS_PER_SOURCE)
+    ds  = _load_source(src, cap)
+    if ds is not None:
+        all_ds.append(ds)
+
+if not all_ds:
+    raise RuntimeError("All dataset sources failed. Check HF_TOKEN and source names.")
+
+train_dataset = concatenate_datasets(all_ds).shuffle(seed=SEED)
+
+# ── Token length statistics ───────────────────────────────────────────────
+print(f"\n📈  Dataset stats:")
+print(f"    Total rows : {len(train_dataset):,}")
+
+_n      = min(1_000, len(train_dataset))
+_sample = random.sample(range(len(train_dataset)), _n)
+_lens   = sorted([
+    len(tokenizer(train_dataset[i]["text"], add_special_tokens=False)["input_ids"])
+    for i in _sample
+])
+_pct_trunc = sum(1 for l in _lens if l > SEQ_LEN) / _n * 100
+
+print(f"    p50={_lens[int(_n*.50)]}  p75={_lens[int(_n*.75)]}  "
+      f"p90={_lens[int(_n*.90)]}  p99={_lens[int(_n*.99)]}")
+print(f"    ~{_pct_trunc:.1f}% of examples exceed SEQ_LEN={SEQ_LEN} "
+      f"→ truncated, <|im_end|> enforced by Qwen35Collator")
+
+# ── Save to disk ──────────────────────────────────────────────────────────
+print(f"\n💾  Saving to {DATASET_PATH}…")
+train_dataset.save_to_disk(DATASET_PATH)
+print(f"    {len(train_dataset):,} rows saved")
+
+del all_ds
+gc.collect()
+print("\n✅  Cell 3 complete — run Cell 4 to start training.")
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  CELL 4 — DDP TRAINING via notebook_launcher
+#
+#  notebook_launcher forks 2 processes (Linux / Kaggle — fork is safe here).
+#  Each process:
+#    • Gets its own GPU  (rank 0 → GPU 0, rank 1 → GPU 1)
+#    • Loads the FULL Qwen3.5-4B model in FP16 (~8 GB per GPU)
+#    • Processes different mini-batches (DistributedSampler splits data)
+#    • All-reduces gradients after backward  (DDP synchronisation)
+#    • Only rank 0 saves checkpoints + pushes to HF Hub
+#
+#  Why device_map=None (not "auto"):
+#    device_map="auto" = pipeline parallelism: GPU0 → layers 0-15,
+#    GPU1 → layers 16-31, processed SEQUENTIALLY with batch=1.
+#    GPU1 idles while GPU0 runs and vice versa — ~10-15% speedup only.
+#
+#    device_map=None + notebook_launcher(num_processes=2) = data parallelism:
+#    BOTH GPUs process DIFFERENT sequences SIMULTANEOUSLY → ~1.8× speedup.
+#
+#  ⚠️  Do NOT load the model before calling notebook_launcher.
+#      CUDA contexts cannot be inherited across fork.
+# ═══════════════════════════════════════════════════════════════════════════
+
+import contextlib
+import math
+import time as _time
+from typing import Optional   # ← explicit import here (defensive — train() runs in fork)
+
+from accelerate import notebook_launcher
+from peft import LoraConfig
+from transformers import (
+    AutoModelForCausalLM,
+    TrainerCallback,
+    TrainerControl,
+    TrainerState,
+)
+from trl import DataCollatorForCompletionOnlyLM, SFTConfig, SFTTrainer
+
+
+# ─────────────────────────────────────────────────────────────────────────
+#  Qwen35Collator — enforces <|im_end|> on truncated sequences
+#
+#  Problem:
+#    SFTTrainer truncates examples that exceed SEQ_LEN tokens. After
+#    truncation, the last token is whatever was at position SEQ_LEN in
+#    the middle of a reasoning chain — often a mid-word subword piece.
+#    Training on sequences that end mid-thought teaches the model that
+#    reasoning chains don't need to terminate, directly causing the
+#    "never stops" / "hallucination loop" failure mode.
+#
+#  Fix:
+#    After the parent collator runs (which handles truncation and label
+#    masking), find the last real (non-padding) token in each sequence
+#    and replace it with <|im_end|>. The model always sees a stop signal,
+#    even if the reasoning chain was cut short by truncation.
+#
+#  Label handling:
+#    The replaced token's label is set to <|im_end|>'s ID (never -100),
+#    so the model is always trained to predict the stop signal.
+# ─────────────────────────────────────────────────────────────────────────
+
+class Qwen35Collator(DataCollatorForCompletionOnlyLM):
+
+    def __init__(self, im_end_id: int, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.im_end_id = im_end_id
+
+    def __call__(self, features):
+        batch  = super().__call__(features)
+        ids    = batch["input_ids"]    # (B, T) long tensor
+        labels = batch["labels"]       # (B, T) long tensor, -100 for masked
+
+        pad_id = self.tokenizer.pad_token_id or 0
+
+        for i in range(ids.size(0)):
+            non_pad = (ids[i] != pad_id).nonzero(as_tuple=False)
+            if non_pad.numel() == 0:
+                continue
+            last = non_pad[-1].item()
+            if ids[i, last].item() != self.im_end_id:
+                ids[i, last]    = self.im_end_id
+                labels[i, last] = self.im_end_id   # Always train on the stop token
+
+        batch["input_ids"] = ids
+        batch["labels"]    = labels
+        return batch
+
+
+# ─────────────────────────────────────────────────────────────────────────
+#  HubPruneCallback — prevents hub repo from growing unboundedly
+#
+#  Problem:
+#    hub_strategy="checkpoint" pushes a new checkpoint-N/ folder to the
+#    hub at every save. With SAVE_EVERY_STEPS=300 and TRAIN_STEPS=30,000
+#    that's 100 pushes = ~100 × 100 MB = ~10 GB of checkpoint data on hub.
+#
+#  Fix:
+#    After each successful push, delete all but the 3 newest checkpoint-N/
+#    folders from the hub (keeps last-checkpoint/ untouched — that's the
+#    primary resume target).
+# ─────────────────────────────────────────────────────────────────────────
+
+class HubPruneCallback(TrainerCallback):
+    """Deletes old checkpoint-N/ folders from the HF Hub after each save."""
+
+    def __init__(self, hub_repo: str, token: str, keep: int = 3):
+        self.repo  = hub_repo
+        self.token = token
+        self.keep  = keep
+        self._api  = HfApi(token=token)
+
+    def on_save(self, args, state: TrainerState, control: TrainerControl, **kw):
+        if not state.is_world_process_zero:
+            return   # Only rank 0 prunes
+        try:
+            all_files = list(self._api.list_repo_files(self.repo))
+        except Exception:
+            return
+
+        names: list[str] = sorted(
+            {f.split("/")[0] for f in all_files
+             if f.split("/")[0].startswith("checkpoint-")},
+            key = lambda x: int(x.split("-", 1)[1]),
+        )
+
+        to_delete = names[: max(0, len(names) - self.keep)]
+        for old in to_delete:
+            for f in all_files:
+                if f.startswith(f"{old}/"):
+                    try:
+                        self._api.delete_file(
+                            path_in_repo = f,
+                            repo_id      = self.repo,
+                            token        = self.token,
+                        )
+                    except Exception:
+                        pass
+            print(f"\n  🗑️  Pruned old hub checkpoint: {old}")
+
+
+# ─────────────────────────────────────────────────────────────────────────
+#  TimingCallback — prints real sec/step after step 10
+# ─────────────────────────────────────────────────────────────────────────
+
+class TimingCallback(TrainerCallback):
+
+    def __init__(self):
+        self._times: list[float] = []
+        self._t0: Optional[float] = None
+
+    def on_step_begin(self, args, state, control, **kw):
+        self._t0 = _time.perf_counter()
+
+    def on_step_end(self, args, state, control, **kw):
+        if self._t0 is not None:
+            self._times.append(_time.perf_counter() - self._t0)
+
+        if len(self._times) == 10:
+            avg      = sum(self._times) / 10
+            left     = args.max_steps - state.global_step
+            eta_hrs  = left * avg / 3600
+            acct_est = math.ceil(eta_hrs / 30)   # 30 clock-hrs per Kaggle account
+            sess_est = math.ceil(eta_hrs / 12)    # 12-hr max per session
+
+            print(f"\n{'═'*62}")
+            print(f"  ⏱️  TIMING REPORT  (average of first 10 steps)")
+            print(f"  sec / optimiser step     : {avg:.1f}")
+            print(f"  steps / hour             : {3600/avg:.0f}")
+            print(f"  steps remaining          : {left:,}")
+            print(f"  estimated hours left     : {eta_hrs:.1f}")
+            print(f"  estimated sessions left  : ~{sess_est}")
+            print(f"  Kaggle accounts needed   : ~{acct_est}  (30 hr/acc)")
+            print(f"{'═'*62}\n")
+
+
+# ─────────────────────────────────────────────────────────────────────────
+#  SafeSFTTrainer — NaN/Inf protection
+#
+#  FP16 on T4 can produce NaN/Inf from overflow in long activation sequences.
+#  Without detection, one bad batch propagates corrupt weights forward.
+#
+#  CRITICAL CONTRACT (HF Trainer backward protocol):
+#    self.accelerator.backward(loss) receives the FULL undivided loss.
+#    Accelerate's internal GradScaler (enabled by fp16=True in SFTConfig)
+#    handles FP16 underflow scaling automatically.
+#    The returned value is loss / grad_accum for Trainer's LOGGING only.
+#
+#  Previous versions divided BEFORE backward → gradients were 8× too small
+#  → effective LR was 1e-4 / 8 = 1.25e-5 for the ENTIRE run.
+# ─────────────────────────────────────────────────────────────────────────
+
+class SafeSFTTrainer(SFTTrainer):
+
+    NAN_LIMIT = 20
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._nan_count = 0
+
+    def training_step(self, model, inputs, **kwargs):
+        model.train()
+        inputs = self._prepare_inputs(inputs)
+
+        try:
+            ctx = self.compute_loss_context_manager()
+        except AttributeError:
+            ctx = contextlib.nullcontext()
+
+        with ctx:
+            loss = self.compute_loss(model, inputs, **kwargs)
+
+        loss_val = loss.detach().float().item()
+
+        if not math.isfinite(loss_val):
+            self._nan_count += 1
+            if self.accelerator.is_main_process:
+                print(f"\n  ⚠️  NaN/Inf loss at step ~{self.state.global_step} "
+                      f"({self._nan_count}/{self.NAN_LIMIT}) — skipping step")
+            if self._nan_count >= self.NAN_LIMIT:
+                raise RuntimeError(
+                    f"Training aborted: {self.NAN_LIMIT} NaN/Inf losses in a row.\n"
+                    "Likely FP16 overflow. Try lowering LR or SEQ_LEN."
+                )
+            model.zero_grad()
+            return loss.new_tensor(0.0)
+
+        self._nan_count = 0
+        self.accelerator.backward(loss)   # ← FULL loss; GradScaler handles FP16 scaling
+        return loss.detach() / self.args.gradient_accumulation_steps
+
+
+# ─────────────────────────────────────────────────────────────────────────
+#  train()  — runs inside each DDP process
+#
+#  All global variables from Cell 2 / Cell 3 (HF_TOKEN, HUB_REPO,
+#  SEQ_LEN, TRAIN_STEPS, etc.) are inherited via Linux fork.
+#  This is safe on Kaggle (Linux) but would fail on Windows (spawn).
+# ─────────────────────────────────────────────────────────────────────────
+
+def train():
+    import gc
+    import torch
+    from datasets import load_from_disk
+    from peft import LoraConfig
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+    from trl import SFTConfig
+
+    # Re-create tokenizer inside the fork (tokenizers use global state)
+    tok = AutoTokenizer.from_pretrained(MODEL_NAME, trust_remote_code=True)
+    if tok.pad_token is None:
+        tok.pad_token    = tok.eos_token
+        tok.pad_token_id = tok.eos_token_id
+    im_end_id = tok.convert_tokens_to_ids(IM_END_STR)
+
+    # Load pre-processed dataset from disk (Arrow memory-mapped — no RAM duplication)
+    dataset = load_from_disk(DATASET_PATH)
+
+    # ── Model (device_map=None — REQUIRED for DDP) ────────────────────────
+    # Trainer/Accelerate moves it to the correct GPU AFTER DDP initialisation.
+    # Using device_map="auto" here would create pipeline-parallel placement
+    # that is incompatible with DDP's data-parallel gradient all-reduce.
+    model = AutoModelForCausalLM.from_pretrained(
+        MODEL_NAME,
+        torch_dtype       = torch.float16,   # FP16: correct for T4 (no native BF16)
+        device_map        = None,            # ← critical: let DDP place the model
+        use_cache         = False,           # required for gradient checkpointing
+        trust_remote_code = True,
+    )
+
+    # ── LoRA (passed to SFTTrainer, NOT applied manually) ─────────────────
+    # SFTTrainer calls get_peft_model() internally. Calling it here TOO would
+    # apply LoRA twice, causing the adapter to be frozen on the second pass.
+    peft_config = LoraConfig(
+        r              = LORA_R,
+        lora_alpha     = LORA_ALPHA,
+        lora_dropout   = LORA_DROPOUT,
+        bias           = "none",
+        task_type      = "CAUSAL_LM",
+        target_modules = ["q_proj", "k_proj", "v_proj", "o_proj",
+                          "gate_proj", "up_proj", "down_proj"],
+    )
+
+    # ── Collator (token IDs not string — context-safe for special tokens) ─
+    response_template_ids = tok.encode("<|im_start|>assistant\n", add_special_tokens=False)
+    collator = Qwen35Collator(
+        im_end_id         = im_end_id,
+        response_template = response_template_ids,
+        tokenizer         = tok,
+        mlm               = False,
+    )
+
+    # ── SFTConfig ─────────────────────────────────────────────────────────
+    training_args = SFTConfig(
+        output_dir = OUTPUT_DIR,
+
+        # SFT fields
+        max_seq_length     = SEQ_LEN,
+        dataset_text_field = "text",
+        packing            = False,   # REQUIRED: GatedDeltaNet cannot use packing
+
+        # Steps
+        max_steps                   = TRAIN_STEPS,
+        per_device_train_batch_size = BATCH_PER_DEVICE,
+        gradient_accumulation_steps = GRAD_ACCUM,
+
+        # LR
+        learning_rate     = LR,
+        warmup_steps      = WARMUP_STEPS,
+        lr_scheduler_type = "cosine",
+        weight_decay      = WEIGHT_DECAY,
+
+        # Precision (fp16 = correct for T4 — no native BF16 hardware)
+        fp16 = True,
+        bf16 = False,
+
+        # Memory
+        gradient_checkpointing        = True,
+        gradient_checkpointing_kwargs = {"use_reentrant": False},
+        # use_reentrant=False: required for DDP — reentrant checkpointing
+        # conflicts with DDP's gradient hooks on the same parameters.
+
+        # Optimizer (8-bit Adam: same convergence, ~300 MB less VRAM/GPU)
+        optim = "adamw_8bit",
+
+        # Periodic VRAM flush: prevents fragmentation OOM during 12-hr sessions
+        torch_empty_cache_steps = 50,
+
+        # Logging
+        logging_steps = 10,
+        report_to     = "none",
+
+        # Checkpointing
+        # save_strategy="steps" is REQUIRED — without it, save_steps is silently
+        # ignored and NO checkpoints are ever written to disk.
+        save_strategy    = "steps",
+        save_steps       = SAVE_EVERY_STEPS,
+        save_total_limit = KEEP_CHECKPOINTS,   # local disk only
+
+        # HF Hub push
+        # hub_strategy="checkpoint" does two things on every save:
+        #   (a) pushes checkpoint-N/ to hub  (like every_save)
+        #   (b) updates last-checkpoint/     (for easy resume via hub_resume())
+        # hub_always_push=True prevents skipping a push when the previous
+        # upload is still in-flight on slow Kaggle connections.
+        push_to_hub    = True,
+        hub_model_id   = HUB_REPO,
+        hub_strategy   = "checkpoint",
+        hub_token      = HF_TOKEN,
+        hub_always_push = True,
+
+        # Misc
+        seed                       = SEED,
+        dataloader_pin_memory      = False,
+        remove_unused_columns      = True,
+        # ddp_find_unused_parameters=False: LoRA only trains adapter params →
+        # no unused parameters → DDP doesn't need to scan for them (faster)
+        ddp_find_unused_parameters = False,
+    )
+
+    # ── Trainer ───────────────────────────────────────────────────────────
+    trainer = SafeSFTTrainer(
+        model         = model,
+        train_dataset = dataset,
+        peft_config   = peft_config,   # SFTTrainer applies LoRA internally
+        tokenizer     = tok,
+        args          = training_args,
+        data_collator = collator,
+        callbacks     = [
+            TimingCallback(),
+            HubPruneCallback(HUB_REPO, HF_TOKEN, keep=KEEP_HUB_CKPTS),
+        ],
+    )
+
+    # trainer.accelerator is set up by SFTTrainer — use it directly.
+    # Do NOT create a new Accelerator() here — it would conflict with
+    # the DDP process group already initialised by the trainer.
+    is_main = trainer.accelerator.is_main_process
+
+    if is_main:
+        trainer.model.print_trainable_parameters()
+        print(f"\n{'═'*70}")
+        print(f"  🔥  TRAINING")
+        print(f"  Steps    : {TRAIN_STEPS:,}  |  Resume: {HAS_CHECKPOINT}")
+        print(f"  SEQ_LEN  : {SEQ_LEN}")
+        print(f"  Eff batch: {BATCH_PER_DEVICE} × 2 GPUs × {GRAD_ACCUM} = "
+              f"{BATCH_PER_DEVICE * 2 * GRAD_ACCUM} seq/step")
+        print(f"  LR       : {LR:.0e}  →  {WARMUP_STEPS} warmup → cosine decay")
+        print(f"  Save     : every {SAVE_EVERY_STEPS} steps  →  {HUB_REPO}")
+        print(f"{'═'*70}\n")
+
+    trainer.train(resume_from_checkpoint=HAS_CHECKPOINT)
+
+    if is_main:
+        print("\n📤  Pushing final checkpoint…")
+    trainer.push_to_hub("Final checkpoint — training complete")
+    if is_main:
+        print(f"\n✅  Done. Model at: https://huggingface.co/{HUB_REPO}")
+        print()
+        print("  To resume on a new session / next account:")
+        print("  → Run Cell 2 (same HF_TOKEN + HUB_REPO)")
+        print("  → Run Cell 3  (downloads last-checkpoint/, re-formats dataset)")
+        print("  → Run Cell 4  (resumes from last saved step automatically)")
+
     gc.collect()
     torch.cuda.empty_cache()
 
-    try: _upload_q.put_nowait(snap_dir)
-    except queue.Full: pass
 
-def _upload_worker() -> None:
-    while True:
-        if _stop_event.is_set() and _upload_q.empty(): break
-        try: folder = _upload_q.get(timeout=5)
-        except queue.Empty: continue
-        try:
-            api.upload_folder(repo_id=HUB_REPO, folder_path=str(folder), path_in_repo=f"snapshots/{folder.name}", token=HF_TOKEN)
-            _prune_hf_snapshots(keep=KEEP_SNAPSHOTS)
-        except Exception as e: pass
-        finally: _upload_q.task_done()
+# ── Launch ────────────────────────────────────────────────────────────────
+from huggingface_hub import HfApi   # needed by HubPruneCallback in forked proc
 
-_uploader = threading.Thread(target=_upload_worker, daemon=True)
-_uploader.start()
+print("🚀  Launching DDP on 2×T4  (data-parallel, ~1.8× speedup)…\n")
 
-_session_start     = time.perf_counter()
-_start_global_step = global_step
-
-try:
-    model.train()
-    optimizer.zero_grad(set_to_none=True)
-
-    while global_step < TRAIN_STEPS:
-        batch = batcher.next_batch()
-        if batch is None: break
-
-        with autocast_ctx:
-            out  = model(
-                input_ids      = batch["input_ids"],
-                attention_mask = batch["attention_mask"],
-                labels         = batch["labels"],   
-            )
-            loss = out.loss / GRAD_ACCUM
-
-        loss.backward()
-        micro_step += 1
-
-        loss_val = loss.detach().float().item() * GRAD_ACCUM
-        del out, loss, batch
-
-        if micro_step >= GRAD_ACCUM:
-            torch.nn.utils.clip_grad_norm_(trainable, 1.0)
-            optimizer.step()
-            scheduler.step()               
-            optimizer.zero_grad(set_to_none=True)
-
-            global_step += 1
-            micro_step   = 0
-
-            if global_step % 10 == 0:
-                elapsed   = time.perf_counter() - _session_start
-                done      = max(1, global_step - _start_global_step)
-                sps       = elapsed / done                  
-                eta_s     = sps * max(0, TRAIN_STEPS - global_step)
-                cur_lr    = scheduler.get_last_lr()[0]
-                print(f"step {global_step:>6}/{TRAIN_STEPS} | loss {loss_val:.4f} | lr {cur_lr:.2e} | eta {eta_s / 3600:.1f}h")
-
-            if global_step % SAVE_EVERY_STEPS == 0:
-                _save_snapshot(f"step_{global_step}")
-            
-            # 6-Hour Time Based Upload Logic
-            if time.time() - _last_upload_ts >= UPLOAD_INTERVAL:
-                print("\n⏰ 6 Hours elapsed. Queueing snapshot upload...")
-                _save_snapshot("time_based")
-                _last_upload_ts = time.time()
-
-            if global_step % 100 == 0:
-                gc.collect()
-
-    if micro_step > 0:
-        torch.nn.utils.clip_grad_norm_(trainable, 1.0)
-        optimizer.step()
-        scheduler.step()
-        optimizer.zero_grad(set_to_none=True)
-        global_step += 1
-        micro_step   = 0
-
-finally:
-    print("\n📦  Saving final snapshot…")
-    _save_snapshot("final")
-    try: _upload_q.join()
-    except Exception: pass
-    _stop_event.set()
-    try: _uploader.join(timeout=90)
-    except Exception: pass
-    print(f"✅  DONE  —  completed at step {global_step}")
+notebook_launcher(
+    train,
+    num_processes = 2,
+    use_port      = "29500",
+)
