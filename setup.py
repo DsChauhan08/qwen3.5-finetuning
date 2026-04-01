@@ -2,9 +2,9 @@ import os
 
 HF_TOKEN   = "hf_XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX"   # ← YOUR TOKEN
 HUB_REPO   = "dschauhan08/qwen-reasoning-finetuned"      # ← YOUR REPO
-MODEL_NAME = "Qwen/Qwen3.5-4B"
+MODEL_NAME = "Qwen/Qwen3.5-0.8B"
 
-SEQ_LEN          = 4500
+SEQ_LEN          = 4096
 BATCH_PER_DEVICE = 1
 GRAD_ACCUM       = 4      # Effective = 1 × 2 GPUs × 4 = 8 sequences/step
 
@@ -23,7 +23,6 @@ KEEP_HUB_CKPTS    = 3
 MAX_ROWS_PER_SOURCE = 15_000
 SEED       = 42
 OUTPUT_DIR = "./qwen_train_out"
-
 # ── Dataset sources ────────────────────────────────────────────────────────
 DATASET_SOURCES = [
 
@@ -36,16 +35,9 @@ DATASET_SOURCES = [
     # ── NVIDIA ────────────────────────────────────────────────────────────
     {"name": "nvidia/OpenCodeReasoning-2", "split": "python"},
     {"name": "nvidia/OpenCodeReasoning-2", "split": "cpp"},
-    {"name": "nvidia/Nemotron-SFT-Competitive-Programming-v2", "split": "competitive_coding_python"},
-    {"name": "nvidia/Nemotron-SFT-Competitive-Programming-v2", "split": "competitive_coding_cpp"},
-    {"name": "nvidia/Nemotron-SFT-Competitive-Programming-v2", "split": "exercism"},
-    "nvidia/Nemotron-RL-ReasoningGym-v1",
-
     # ── Other reasoning ───────────────────────────────────────────────────
     "Roman1111111/gemini-3.1-pro-hard-high-reasoning",
     "Roman1111111/gpt-5.4-step-by-step-reasoning",
-    "artillerywu/DeepResearch-9K",
-
     # ── Mixed style (lower caps to avoid dialect dilution) ────────────────
     "Crownelius/GLM-5.0-8000x-formatted-fixed",
     "Crownelius/Opus-4.5-3000x-formatted",
@@ -53,11 +45,8 @@ DATASET_SOURCES = [
 
     # ── tandevllc offsec ──────────────────────────────────────────────────
     {"name": "tandevllc/offsec_redteam_codes", "config": "penetration-testing"},
-    {"name": "tandevllc/offsec_redteam_codes", "config": "exploit"},
-    {"name": "tandevllc/offsec_redteam_codes", "config": "red-team"},
     {"name": "tandevllc/offsec_redteam_codes", "config": "malware-analysis"},
     {"name": "tandevllc/offsec_redteam_codes", "config": "ethical-hacking"},
-    {"name": "tandevllc/offsec_redteam_codes", "config": "privilege-escalation"},
 ]
 
 STYLE_CAPS = {
@@ -76,5 +65,3 @@ print(f"    Model   : {MODEL_NAME}")
 print(f"    SEQ_LEN : {SEQ_LEN}")
 print(f"    Steps   : {TRAIN_STEPS:,}  (warmup: {WARMUP_STEPS})")
 print(f"    Sources : {len(DATASET_SOURCES)}")
-
-
