@@ -1,3 +1,4 @@
+
 # ═══════════════════════════════════════════════════════════════════════════
 #  CELL 3 — PREPARATION  (streaming — no full downloads, ~50–150 MB disk)
 # ═══════════════════════════════════════════════════════════════════════════
@@ -305,6 +306,7 @@ from transformers import (
 # ── Safe TRL Imports (Top level) ───────────────────────────────────────────
 from trl import SFTConfig, SFTTrainer
 try:
+    # older/newer TRL variants
     from trl import DataCollatorForCompletionOnlyLM
 except Exception:
     try:
@@ -424,6 +426,7 @@ def train():
     # ── Safe TRL Imports (Inside fork) ──────────────────────────────────
     from trl import SFTConfig, SFTTrainer
     try:
+        # older/newer TRL variants
         from trl import DataCollatorForCompletionOnlyLM
     except Exception:
         try:
