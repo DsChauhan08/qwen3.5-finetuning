@@ -2,7 +2,7 @@ import os
 
 HF_TOKEN   = "hf_XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX"   # ← YOUR TOKEN
 HUB_REPO   = "dschauhan08/qwen-reasoning-finetuned"      # ← YOUR REPO
-MODEL_NAME = "Qwen/Qwen3.5-0.8B"
+MODEL_NAME = "Qwen/Qwen3.5-4B"
 
 SEQ_LEN          = 4096
 BATCH_PER_DEVICE = 1
